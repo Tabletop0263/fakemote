@@ -1,0 +1,31 @@
+name: wii-build
+on: [push, workflow_dispatch]
+jobs:
+  fakemote:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y git cmake ninja-build g++ make
+          dkp-pacman -S --needed --noconfirm devkitarm-cmake
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: stripios
+        run: |
+          git clone --depth 1 https://github.com/Leseratte10/d2xl-cios.git /tmp/d2xl
+          cd /tmp/d2xl/stripios
+          g++ main.cpp -o stripios
+          cp stripios $DEVKITPRO/tools/bin/
+      - name: Build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/devkitARM.cmake ..
+          make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FAKEMOTE
+          path: build/**/*.app
+          if-no-files-found: error
