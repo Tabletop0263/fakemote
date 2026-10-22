@@ -26,7 +26,7 @@ static inline const egc_device_driver_t *get_usb_device_driver_for(u16 vid, u16 
             return usb_device_drivers[i];
     }
 
-    return NULL;
+    return &mouse_usb_device_driver;
 }
 
 bool _egc_usb_device_is_supported(u16 vid, u16 pid)
