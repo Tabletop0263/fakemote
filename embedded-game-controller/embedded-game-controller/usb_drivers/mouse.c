@@ -2,11 +2,21 @@
 #include "utils.h"
 
 /* Generic USB HID mouse -> pointer (touch point 0) + A/B/Home/+/-.
- * Assumes the common 3-5 byte layout: [buttons][dx s8][dy s8][wheel s8].
- * Claimed as a fallback for HID devices no other driver wants. */
+ * Claimed as a fallback for HID devices no other driver wants.
+ *
+ * Two report formats are handled:
+ *  - boot style (default): endpoint 0x81, [buttons][dx s8][dy s8][wheel s8]
+ *  - 32c2:0066 "2.4G Wireless" dongle (e.g. heyday BEMS01): the mouse is
+ *    interface 1, endpoint 0x82, reports are
+ *    [0x02][buttons][x lo][x hi:4 | y lo:4][y hi][wheel][pan], X/Y 12-bit signed.
+ *    The same endpoint also carries report IDs 0x01/0x03/0xB5, which we ignore. */
 
-#define MOUSE_ENDPOINT (EGC_USB_ENDPOINT_IN | 1)
-#define MOUSE_SENS     40 /* touch units per mouse count; range is 0..0x7fff */
+#define MOUSE_SENS 40 /* touch units per mouse count; range is 0..0x7fff */
+
+enum mouse_format_e {
+    MOUSE_FMT_BOOT,
+    MOUSE_FMT_RID2_12BIT,
+};
 
 enum mouse_buttons_e {
     MOUSE_BTN_LEFT,
@@ -22,6 +32,8 @@ enum mouse_buttons_e {
 struct mouse_private_data_t {
     s32 x;
     s32 y;
+    u8 endpoint;
+    u8 format;
 };
 static_assert(sizeof(struct mouse_private_data_t) <= EGC_INPUT_DEVICE_PRIVATE_DATA_SIZE);
 
@@ -73,28 +85,53 @@ static void intr_transfer_cb(egc_usb_transfer_t *transfer)
     struct mouse_private_data_t *priv = (void *)device->private_data;
     const u8 *report = (const u8 *)transfer->data;
 
-    if (transfer->status == EGC_USB_TRANSFER_STATUS_COMPLETED && transfer->length >= 3) {
-        struct egc_input_state_t state;
-        u8 *p = (u8 *)&state;
-        for (unsigned i = 0; i < sizeof(state); i++)
-            p[i] = 0;
+    if (transfer->status == EGC_USB_TRANSFER_STATUS_COMPLETED) {
+        s32 dx = 0, dy = 0;
+        s8 wheel = 0;
+        u32 buttons = 0;
+        bool valid = false;
 
-        s8 wheel = transfer->length >= 4 ? (s8)report[3] : 0;
-        u32 buttons = report[0] & 0x1f;
-        if (wheel > 0)
-            buttons |= 1 << MOUSE_BTN_WHEEL_UP;
-        else if (wheel < 0)
-            buttons |= 1 << MOUSE_BTN_WHEEL_DOWN;
+        if (priv->format == MOUSE_FMT_RID2_12BIT) {
+            if (transfer->length >= 6 && report[0] == 0x02) {
+                buttons = report[1] & 0x1f;
+                dx = report[2] | ((report[3] & 0x0f) << 8);
+                dy = (report[3] >> 4) | (report[4] << 4);
+                if (dx & 0x800)
+                    dx -= 0x1000;
+                if (dy & 0x800)
+                    dy -= 0x1000;
+                wheel = (s8)report[5];
+                valid = true;
+            }
+        } else if (transfer->length >= 3) {
+            buttons = report[0] & 0x1f;
+            dx = (s8)report[1];
+            dy = (s8)report[2];
+            wheel = transfer->length >= 4 ? (s8)report[3] : 0;
+            valid = true;
+        }
 
-        priv->x = clamp_pos(priv->x + (s8)report[1] * MOUSE_SENS);
-        priv->y = clamp_pos(priv->y + (s8)report[2] * MOUSE_SENS);
+        if (valid) {
+            struct egc_input_state_t state;
+            u8 *p = (u8 *)&state;
+            for (unsigned i = 0; i < sizeof(state); i++)
+                p[i] = 0;
 
-        state.gamepad.buttons = egc_device_driver_map_buttons(buttons, MOUSE_BTN_COUNT, s_button_map);
-        state.gamepad.touch_points[0].x = priv->x;
-        state.gamepad.touch_points[0].y = priv->y;
-        state.gamepad.touch_points[1].x = -1;
+            if (wheel > 0)
+                buttons |= 1 << MOUSE_BTN_WHEEL_UP;
+            else if (wheel < 0)
+                buttons |= 1 << MOUSE_BTN_WHEEL_DOWN;
 
-        egc_device_driver_report_input(device, &state);
+            priv->x = clamp_pos(priv->x + dx * MOUSE_SENS);
+            priv->y = clamp_pos(priv->y + dy * MOUSE_SENS);
+
+            state.gamepad.buttons = egc_device_driver_map_buttons(buttons, MOUSE_BTN_COUNT, s_button_map);
+            state.gamepad.touch_points[0].x = priv->x;
+            state.gamepad.touch_points[0].y = priv->y;
+            state.gamepad.touch_points[1].x = -1;
+
+            egc_device_driver_report_input(device, &state);
+        }
     }
 
     mouse_request_data(device);
@@ -102,8 +139,9 @@ static void intr_transfer_cb(egc_usb_transfer_t *transfer)
 
 static int mouse_request_data(egc_input_device_t *device)
 {
+    struct mouse_private_data_t *priv = (void *)device->private_data;
     const egc_usb_transfer_t *transfer = egc_device_driver_issue_intr_transfer_async(
-        device, MOUSE_ENDPOINT, NULL, 0, intr_transfer_cb);
+        device, priv->endpoint, NULL, 0, intr_transfer_cb);
     return transfer != NULL ? 0 : -1;
 }
 
@@ -118,6 +156,13 @@ static int mouse_driver_ops_init(egc_input_device_t *device, u16 vid, u16 pid)
     struct mouse_private_data_t *priv = (void *)device->private_data;
     priv->x = EGC_GAMEPAD_TOUCH_RES / 2;
     priv->y = EGC_GAMEPAD_TOUCH_RES / 2;
+    if (vid == 0x32c2 && pid == 0x0066) {
+        priv->endpoint = EGC_USB_ENDPOINT_IN | 2;
+        priv->format = MOUSE_FMT_RID2_12BIT;
+    } else {
+        priv->endpoint = EGC_USB_ENDPOINT_IN | 1;
+        priv->format = MOUSE_FMT_BOOT;
+    }
     device->desc = &s_device_description;
     egc_device_driver_set_timer(device, 1000 * 500, 0);
     return 0;
